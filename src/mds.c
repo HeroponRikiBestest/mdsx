@@ -7,6 +7,9 @@
 
 int main(int argc, const char *argv[])
 {
+    int isMDX = 0;
+    u64 mdxOffset = 0;
+    u64 mdxSize1 = 0;
 
     if (argc < 2)
     {
@@ -32,7 +35,16 @@ int main(int argc, const char *argv[])
     }
 
     fseek(mds, 0x2c, SEEK_SET);
-    u32 offset = freadU32(mds);
+    u64 offset = freadU32(mds);
+
+    if (offset == 0xffffffff)
+    {
+        isMDX = 1;
+        mdxOffset = freadU64(mds);
+        mdxSize1 = freadU64(mds);
+
+        offset = mdxOffset + (mdxSize1 - 0x40);
+    }
 
     fseek(mds, offset, SEEK_SET);
 
@@ -46,12 +58,23 @@ int main(int argc, const char *argv[])
     u32 comSize = getU32(data1 + 0x150); //compressed size?
     u32 decSize = getU32(data1 + 0x154); //decompressed size?
 
-    fseek(mds, 0x30, SEEK_SET);
-    u8 *data2 = (u8 *)malloc(offset - 0x30);
-    fread(data2, 1, offset - 0x30, mds);
+    u64 data2Offset = 0x30;  // for MDSv2
+    u64 data2Size = offset - 0x30; // for MDSv2
+
+    if (isMDX)
+    {
+        data2Offset = mdxOffset;
+        data2Size = mdxSize1 - 0x40;
+    }
+
+    fseek(mds, data2Offset, SEEK_SET);
 
 
-    DecryptBlock(data2, offset - 0x30, 0, 0, 4, ci);
+    u8 *data2 = (u8 *)malloc(data2Size);
+    fread(data2, 1, data2Size, mds);
+
+
+    DecryptBlock(data2, data2Size, 0, 0, 4, ci);
 
     u8 *mdxHeader = (u8 *)malloc(decSize + 0x12);
 
@@ -59,7 +82,7 @@ int main(int argc, const char *argv[])
     infstream.zalloc = Z_NULL;
     infstream.zfree = Z_NULL;
     infstream.opaque = Z_NULL;
-    infstream.avail_in = offset-0x30;
+    infstream.avail_in = data2Size;
     infstream.next_in = data2;
     infstream.avail_out = decSize;
     infstream.next_out = mdxHeader + 0x12;
@@ -171,27 +194,36 @@ int main(int argc, const char *argv[])
         compressed = 1;
 
 
-    if (compressed == 0 && encryptInfo.mode == 0)
+    /*if (compressed == 0 && encryptInfo.mode == -1 && isMDX == 0)
     {
         printf("Not compressed and not encrypted. Nothing to do\n");
         return 0;
+    }*/
+
+    FILE *mdf = NULL;
+    u64 mdfsize = 0;
+
+    if (isMDX == 0)
+    {
+        fclose(mds);
+
+        /* here must be footer filename, but we hardcode *.mdf*/
+        char n_mdf[1024];
+        strcpy(n_mdf, argv[1]);
+        n_mdf[ strlen(n_mdf) - 1 ] = 'f';
+
+        printf("\nReading MDF file %s\n\n", n_mdf);
+
+        mdf = fopen(n_mdf, "rb");
+        fseek(mdf, 0, SEEK_END);
+        mdfsize = ftell(mdf);
+        fseek(mdf, 0, SEEK_SET);
     }
-
-
-    fclose(mds);
-
-
-    /* here must be footer filename, but we hardcode *.mdf*/
-    char n_mdf[1024];
-    strcpy(n_mdf, argv[1]);
-    n_mdf[ strlen(n_mdf) - 1 ] = 'f';
-
-    printf("\nReading MDF file %s\n\n", n_mdf);
-
-    FILE *mdf = fopen(n_mdf, "rb");
-    fseek(mdf, 0, SEEK_END);
-    u64 mdfsize = ftell(mdf);
-    fseek(mdf, 0, SEEK_SET);
+    else
+    {
+        mdf = mds;
+        mdfsize = mdxOffset;
+    }
 
 
     if (compressed)
@@ -348,9 +380,12 @@ int main(int argc, const char *argv[])
         free(ibuf);
         free(dbuf);
     }
-    else if (encryptInfo.mode != -1)
+    else
     {
-        printf("Decrypting\n");
+        if (encryptInfo.mode != -1)
+            printf("Decrypting\n");
+        else
+            printf("Just copy image track data\n");
 
         u8 *ibuf = (u8 *)malloc(secSize);
 
@@ -369,7 +404,8 @@ int main(int argc, const char *argv[])
                 sz = mdfsize - inAddr;
 
             fread(ibuf, sz, 1, mdf);
-            decryptMdxData(&encryptInfo, ibuf, sz, secSize, outAddr / secSize);
+            if (encryptInfo.mode != -1)
+                decryptMdxData(&encryptInfo, ibuf, sz, secSize, outAddr / secSize);
             fwrite(ibuf, sz, 1, outfile);
 
             outAddr += secSize;
@@ -377,10 +413,7 @@ int main(int argc, const char *argv[])
 
         free(ibuf);
     }
-    else
-    {
-        printf("Something going wrong!\n");
-    }
+
 
     fclose(mdf);
     fclose(outfile);

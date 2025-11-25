@@ -160,6 +160,7 @@ inline static void setU32(void *mem, u32 val)
 }
 
 u32 freadU32(FILE *f);
+u64 freadU64(FILE *f);
 void printHex(void *data, int num);
 
 #endif
