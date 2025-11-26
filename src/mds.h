@@ -88,7 +88,7 @@ typedef struct __attribute__((packed))
 	u8 pframe;
 	u32 extra_offset; // 0xc
 	u16 sector_size; // 0x10
-	u8 _unk_1; // 0x12
+	u8 _unk1_; // 0x12
 	u8 _dummy1_[5]; // 0x13
 	u32 _unk2_; // 0x18;
 	u32 _unk3_; // 0x1c;
@@ -98,7 +98,7 @@ typedef struct __attribute__((packed))
 	u32 number_of_files; // 0x30
 	u32 footer_offset; // 0x34
 	u64 start_sector64; // 0x38   major >= 2
-	u64 extra_offset64; // 0x40   major >= 2
+	u64 track_size64; // 0x40   major >= 2
 	u8 _dummy2_[8]; // 0x48
 } MDX_TrackBlock; // 0x50
 

@@ -2,11 +2,29 @@
 #include <zlib.h>
 
 
-
+typedef struct tTrackInfo
+{
+    struct tTrackInfo *next;
+    int id;
+    u16 sector_size;
+    u64 start_offset;
+    u64 length; // in sectors
+    u64 end_offset;
+    u64 footer_offset;
+    u8 footer_flags;
+    u64 unk_num;
+    u64 c_block;
+    u16 *ctable;
+    u32 c_num;
+} TrackInfo;
 
 
 int main(int argc, const char *argv[])
 {
+    int trackCount = 0;
+    TrackInfo *processTracks = NULL;
+    TrackInfo *lastAddTrack = NULL;
+
     int isMDX = 0;
     u64 mdxOffset = 0;
     u64 mdxSize1 = 0;
@@ -96,6 +114,13 @@ int main(int argc, const char *argv[])
     fseek(mds, 0, SEEK_SET);
     fread(mdxHeader, 1, 0x12, mds);
 
+
+    u8 medium_type = getU8(mdxHeader + offsetof(MDX_Header, medium_type));
+    int isCD = 0;
+
+    if (medium_type < 3) // 0, 1, 2
+        isCD = 1;
+
     Decoder encryptInfo;
     encryptInfo.mode = -1;
     encryptInfo.ctr = 1;
@@ -145,11 +170,6 @@ int main(int argc, const char *argv[])
     fwrite(mdxHeader, 1, decSize + 0x12, b);
     fclose(b);
 
-    u32 footerOff = 0;
-
-    u16 secSize = 0x800;
-    u64 startOffset = 0;
-
     u16 numSessions = getU16(mdxHeader + offsetof(MDX_Header, num_sessions));
     u32 sessOffset = getU32(mdxHeader + offsetof(MDX_Header, sessions_blocks_offset));
     for (u16 i = 0; i < numSessions; i++)
@@ -158,41 +178,58 @@ int main(int argc, const char *argv[])
         u8 numAllBlocks = getU8(mdxHeader + sblkOff + offsetof(MDX_SessionBlock, num_all_blocks));
         u32 tracksOff = getU32(mdxHeader + sblkOff + offsetof(MDX_SessionBlock, tracks_blocks_offset));
 
+        u64 sessionStart = (s64)getU64(mdxHeader + sblkOff + offsetof(MDX_SessionBlock, session_start));
+        u64 sessionEnd = (s64)getU64(mdxHeader + sblkOff + offsetof(MDX_SessionBlock, session_end));
+
         for (u8 j = 0; j < numAllBlocks; j++)
         {
             u32 trkOff = tracksOff + j * sizeof(MDX_TrackBlock);
 
             u8 mode = getU8(mdxHeader + trkOff + offsetof(MDX_TrackBlock, mode));
-            if (mode & 7) // ????
+            if ((mode & 7) != 0) // ????
             {
-                footerOff = getU32(mdxHeader + trkOff + offsetof(MDX_TrackBlock, footer_offset));
-                secSize = getU16(mdxHeader + trkOff + offsetof(MDX_TrackBlock, sector_size));
-                startOffset = getU64(mdxHeader + trkOff + offsetof(MDX_TrackBlock, start_offset));
+                TrackInfo *trk = (TrackInfo *)malloc(sizeof(TrackInfo));
+
+                trk->next = NULL;
+                trk->id = trackCount;
+                trk->c_num = 0;
+                trk->ctable = NULL;
+                trk->sector_size = getU16(mdxHeader + trkOff + offsetof(MDX_TrackBlock, sector_size));
+                trk->start_offset = getU64(mdxHeader + trkOff + offsetof(MDX_TrackBlock, start_offset));
+                trk->footer_offset = getU32(mdxHeader + trkOff + offsetof(MDX_TrackBlock, footer_offset));
+
+                trk->footer_flags = getU8(mdxHeader + trk->footer_offset + offsetof(MDX_Footer, flags));
+
+                u64 startSector = getU64(mdxHeader + trkOff + offsetof(MDX_TrackBlock, start_sector));
+
+
+                if (isCD)
+                {
+                    u32 extra_offset = getU32(mdxHeader + trkOff + offsetof(MDX_TrackBlock, extra_offset));
+                    u8 count = getU8(mdxHeader + trkOff + offsetof(MDX_TrackBlock, _unk1_));
+
+                    trk->length = 0;
+
+                    // start from 1 - skip pregap
+                    for(u8 ei = 1; ei < count; ei++)
+                        trk->length += getU32(mdxHeader + extra_offset + ei * 4);
+                }
+                else
+                {
+                    trk->length = getU64(mdxHeader + trkOff + offsetof(MDX_TrackBlock, track_size64));
+                }
+
+                if (lastAddTrack)
+                    lastAddTrack->next = trk;
+
+                if (!processTracks)
+                    processTracks = trk;
+
+                trackCount++;
+                lastAddTrack = trk;
             }
-
-            // Only one footer?
-            if (footerOff)
-                break;
         }
-
-        if (footerOff)
-            break;
     }
-
-
-    /* check footer compression info */
-    u8 fflags = getU8(mdxHeader + footerOff + offsetof(MDX_Footer, flags));
-    u64 numCElm = 0;
-    u16 *cElems = NULL;
-    u64 unknum = 0;
-
-    u64 cBlockSz = 0;
-
-    int compressed = 0;
-
-    if (fflags & 1) //compression?
-        compressed = 1;
-
 
     /*if (compressed == 0 && encryptInfo.mode == -1 && isMDX == 0)
     {
@@ -225,204 +262,209 @@ int main(int argc, const char *argv[])
         mdfsize = mdxOffset;
     }
 
-
-    if (compressed)
+    /* read compression tables for tracks */
+    for (TrackInfo *trk = processTracks; trk; trk = trk->next)
     {
-        u32 sz1 = getU32(mdxHeader + footerOff + offsetof(MDX_Footer, _unk1_size32_));
-        u64 sz2 = getU32(mdxHeader + footerOff + offsetof(MDX_Footer, _unk2_size64_));
-        // seems it's offset relative to the track
-        u64 ctableoff = getU64(mdxHeader + footerOff + offsetof(MDX_Footer, compress_table_offset));
-
-        cBlockSz = sz1 * secSize;
-
-        if ((fflags & 2) == 0 && getU32(mdxHeader + footerOff + offsetof(MDX_Footer, _unk2_size_)) == 0)
+        if (trk->footer_flags & 1) // compressed track
         {
-            unknum = ((secSize - startOffset) - 1 + ctableoff) / secSize; //??? is ctableoff?
+            u32 sz1 = getU32(mdxHeader + trk->footer_offset + offsetof(MDX_Footer, _unk1_size32_));
+            u64 sz2 = getU32(mdxHeader + trk->footer_offset + offsetof(MDX_Footer, _unk2_size64_));
+            u64 ctableoff = getU64(mdxHeader + trk->footer_offset + offsetof(MDX_Footer, compress_table_offset));
+
+            trk->c_block = sz1 * trk->sector_size;
+
+            if ((trk->footer_flags & 2) == 0 && getU32(mdxHeader + trk->footer_offset + offsetof(MDX_Footer, _unk2_size_)) == 0)
+                trk->unk_num = ((trk->sector_size - trk->start_offset) - 1 + ctableoff) / trk->sector_size;
+            else
+                trk->unk_num = getU32(mdxHeader + trk->footer_offset + offsetof(MDX_Footer, _unk2_size_));
+
+            trk->c_num = ((sz1 - 1) + sz2) / sz1;
+            trk->ctable = (u16 *)calloc(trk->c_num, 2);
+
+            u64 filectableoff = trk->start_offset + ctableoff;
+
+            //This is how DT compute size to read
+            u16 *tmpBuff = calloc(trk->c_num + 0x800, 2); // trk->c_num * 2 + 0x1000
+
+            u64 creadsz = (trk->c_num + 0x800) * 2;
+            if ( mdfsize - filectableoff < creadsz )
+                creadsz = mdfsize - filectableoff;
+
+            fseek(mdf, filectableoff, SEEK_SET);
+            fread(tmpBuff, creadsz, 1, mdf);
+
+            z_stream cstrm;
+            cstrm.zalloc = Z_NULL;
+            cstrm.zfree = Z_NULL;
+            cstrm.opaque = Z_NULL;
+            cstrm.avail_in = creadsz;
+            cstrm.next_in = (Bytef *)tmpBuff;
+            cstrm.avail_out = trk->c_num * 2;
+            cstrm.next_out = (Bytef *)trk->ctable;
+
+            inflateInit(&cstrm);
+            inflate(&cstrm, Z_NO_FLUSH);
+            inflateEnd(&cstrm);
+
+            free(tmpBuff);
         }
-        else
-        {
-            unknum = getU32(mdxHeader + footerOff + offsetof(MDX_Footer, _unk2_size_));
-        }
-
-        numCElm = ((sz1 - 1) + sz2) / sz1;
-        cElems = (u16 *)calloc(numCElm, 2);
-
-        u64 filectableoff = startOffset + ctableoff;
-
-        //This is how DT compute size to read
-        u16 *tmpBuff = calloc(numCElm + 0x800, 2); // numCElm * 2 + 0x1000
-
-        u64 creadsz = (numCElm + 0x800) * 2;
-        if ( mdfsize - filectableoff < creadsz )
-            creadsz = mdfsize - filectableoff;
-
-        fseek(mdf, filectableoff, SEEK_SET);
-        fread(tmpBuff, creadsz, 1, mdf);
-
-        z_stream cstrm;
-        cstrm.zalloc = Z_NULL;
-        cstrm.zfree = Z_NULL;
-        cstrm.opaque = Z_NULL;
-        cstrm.avail_in = creadsz;
-        cstrm.next_in = (Bytef *)tmpBuff;
-        cstrm.avail_out = numCElm * 2;
-        cstrm.next_out = (Bytef *)cElems;
-
-        inflateInit(&cstrm);
-        inflate(&cstrm, Z_NO_FLUSH);
-        inflateEnd(&cstrm);
-
-        free(tmpBuff);
     }
 
-    printf("Writing image file info into image.out\n");
+    printf("Writing tracks:\n\n");
 
-    /* we write only first track with data ??? */
-    FILE *outfile = fopen("image.out", "wb");
-
-    fseek(mdf, startOffset, SEEK_SET);
-
-    if (compressed)
+    for (TrackInfo *trk = processTracks; trk; trk = trk->next)
     {
-        u8 *ibuf = (u8 *)malloc(cBlockSz);
-        u8 *dbuf = (u8 *)malloc(cBlockSz);
+        char ofbuf[1024];
+        sprintf(ofbuf, "track%02d.out", trk->id);
 
-        printf("Decompressing");
-        if (encryptInfo.mode != -1)
-            printf(" and decrypt\n");
-        else
-            printf("\n");
+        printf("%s  ", ofbuf);
 
-        u64 outAddr = 0;
-        u64 inAddr = startOffset;
+        if (trk->footer_flags & 1) //compressed
+            putc('c', stdout);
+        if (encryptInfo.mode != -1) //encrypted
+            putc('e', stdout);
+        putc('\n', stdout);
 
-        int progress = 0;
+        FILE *outfile = fopen(ofbuf, "wb");
 
-        for (u32 i = 0; i < numCElm; i++)
+        fseek(mdf, trk->start_offset, SEEK_SET);
+
+        if (trk->footer_flags & 1) //compressed
         {
-            if ( i * 10 / numCElm > progress )
+            u8 *ibuf = (u8 *)malloc(trk->c_block);
+            u8 *dbuf = (u8 *)malloc(trk->c_block);
+
+            u64 outTrackOffset = 0;
+            u64 inAddr = trk->start_offset;
+
+            int progress = 0;
+
+            for (u32 i = 0; i < trk->c_num; i++)
             {
-                progress++;
-                printf("%d%%\n", progress * 10);
-            }
-
-            u32 rdsize = 0;
-
-            u16 elm = cElems[i];
-            if (elm == 0) // decompile flags 0
-            {
-                /* uncompressed data */
-                if ( i + 1 == numCElm )
+                if ( i * 10 / trk->c_num > progress )
                 {
-                    u32 rm = (secSize * unknum) % cBlockSz;
-                    rdsize = cBlockSz;
-                    if (rm)
-                        rdsize = rm;
-                }
-                else
-                {
-                    rdsize = cBlockSz;
+                    progress++;
+                    printf("%d%%\n", progress * 10);
                 }
 
-                fread(ibuf, rdsize, 1, mdf);
+                u32 rdsize = 0;
 
-                if (encryptInfo.mode != -1)
+                u16 elm = trk->ctable[i];
+                if (elm == 0)
                 {
-                    decryptMdxData(&encryptInfo, ibuf, rdsize, cBlockSz, outAddr / cBlockSz);
-                }
+                    // decompile flags 0
+                    /* uncompressed data */
+                    if ( i + 1 == trk->c_num )
+                    {
+                        u32 rm = (trk->sector_size * trk->unk_num) % trk->c_block;
+                        rdsize = trk->c_block;
+                        if (rm)
+                            rdsize = rm;
+                    }
+                    else
+                    {
+                        rdsize = trk->c_block;
+                    }
 
-                fwrite(ibuf, rdsize, 1, outfile);
-            }
-            else
-            {
-                if (elm & 0x8000) // decompile flags 0x80
-                {
-                    memset(ibuf, elm & 0xff, cBlockSz);
-                    fwrite(ibuf, cBlockSz, 1, outfile);
-                }
-                else // decompile flags 0x41
-                {
-                    u8 flags = 0x41;
-
-                    rdsize = elm;
                     fread(ibuf, rdsize, 1, mdf);
 
                     if (encryptInfo.mode != -1)
                     {
-                        decryptMdxData(&encryptInfo, ibuf, rdsize, cBlockSz, outAddr / cBlockSz);
+                        decryptMdxData(&encryptInfo, ibuf, rdsize, trk->c_block, outTrackOffset / trk->c_block);
                     }
 
-                    z_stream cstrm;
-                    cstrm.zalloc = Z_NULL;
-                    cstrm.zfree = Z_NULL;
-                    cstrm.opaque = Z_NULL;
-                    cstrm.avail_in = rdsize;
-                    cstrm.next_in = (Bytef *)ibuf;
-                    cstrm.avail_out = cBlockSz;
-                    cstrm.next_out = (Bytef *)dbuf;
-
-                    if (flags & 0x40)
-                        inflateInit2(&cstrm, -15);
-                    else
-                        inflateInit2(&cstrm, 15);
-
-                    inflate(&cstrm, Z_NO_FLUSH);
-                    inflateEnd(&cstrm);
-
-                    if (cstrm.avail_in > 0)
-                    {
-                        printf("Err uncompress. Remain %d bytes\n", cstrm.avail_in);
-                        return -1;
-                    }
-
-                    fwrite(dbuf, cBlockSz, 1, outfile);
+                    fwrite(ibuf, rdsize, 1, outfile);
                 }
+                else
+                {
+                    if (elm & 0x8000)
+                    {
+                        // decompile flags 0x80
+                        memset(ibuf, elm & 0xff, trk->c_block);
+                        fwrite(ibuf, trk->c_block, 1, outfile);
+                    }
+                    else
+                    {
+                        // decompile flags 0x41
+                        u8 flags = 0x41;
+
+                        rdsize = elm;
+                        fread(ibuf, rdsize, 1, mdf);
+
+                        if (encryptInfo.mode != -1)
+                        {
+                            decryptMdxData(&encryptInfo, ibuf, rdsize, trk->c_block, outTrackOffset / trk->c_block);
+                        }
+
+                        z_stream cstrm;
+                        cstrm.zalloc = Z_NULL;
+                        cstrm.zfree = Z_NULL;
+                        cstrm.opaque = Z_NULL;
+                        cstrm.avail_in = rdsize;
+                        cstrm.next_in = (Bytef *)ibuf;
+                        cstrm.avail_out = trk->c_block;
+                        cstrm.next_out = (Bytef *)dbuf;
+
+                        if (flags & 0x40)
+                            inflateInit2(&cstrm, -15);
+                        else
+                            inflateInit2(&cstrm, 15);
+
+                        inflate(&cstrm, Z_NO_FLUSH);
+                        inflateEnd(&cstrm);
+
+                        if (cstrm.avail_in > 0)
+                        {
+                            printf("Err uncompress. Remain %d bytes\n", cstrm.avail_in);
+                            return -1;
+                        }
+
+                        fwrite(dbuf, trk->c_block, 1, outfile);
+                    }
+                }
+
+                outTrackOffset += trk->c_block;
+                inAddr += rdsize;
             }
 
-            outAddr += cBlockSz;
-            inAddr += rdsize;
+            free(ibuf);
+            free(dbuf);
         }
-
-        free(ibuf);
-        free(dbuf);
-    }
-    else
-    {
-        if (encryptInfo.mode != -1)
-            printf("Decrypting\n");
         else
-            printf("Just copy image track data\n");
-
-        u8 *ibuf = (u8 *)malloc(secSize);
-
-        u64 outAddr = 0;
-        int progress = 0;
-        for(u64 inAddr = startOffset; inAddr < mdfsize; inAddr += secSize)
         {
-            if ( inAddr * 10 / mdfsize > progress )
+            u8 *ibuf = (u8 *)malloc(trk->sector_size);
+
+            u64 outTrackOffset = 0;
+            int progress = 0;
+            u64 bound = trk->start_offset + trk->length * trk->sector_size;
+
+            for(u64 inAddr = trk->start_offset; inAddr < bound; inAddr += trk->sector_size)
             {
-                progress++;
-                printf("%d%%\n", progress * 10);
+                if ( inAddr * 10 / mdfsize > progress )
+                {
+                    progress++;
+                    printf("%d%%\n", progress * 10);
+                }
+
+                u32 sz = trk->sector_size;
+                if (sz > bound - inAddr)
+                    sz = bound - inAddr;
+
+                fread(ibuf, sz, 1, mdf);
+                if (encryptInfo.mode != -1)
+                    decryptMdxData(&encryptInfo, ibuf, sz, trk->sector_size, outTrackOffset / trk->sector_size);
+                fwrite(ibuf, sz, 1, outfile);
+
+                outTrackOffset += trk->sector_size;
             }
 
-            u32 sz = secSize;
-            if (sz > mdfsize - inAddr)
-                sz = mdfsize - inAddr;
-
-            fread(ibuf, sz, 1, mdf);
-            if (encryptInfo.mode != -1)
-                decryptMdxData(&encryptInfo, ibuf, sz, secSize, outAddr / secSize);
-            fwrite(ibuf, sz, 1, outfile);
-
-            outAddr += secSize;
+            free(ibuf);
         }
 
-        free(ibuf);
+        fclose(outfile);
     }
-
 
     fclose(mdf);
-    fclose(outfile);
 
     return 0;
 }
