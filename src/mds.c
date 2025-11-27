@@ -87,10 +87,8 @@ int main(int argc, const char *argv[])
 
     fseek(mds, data2Offset, SEEK_SET);
 
-
     u8 *data2 = (u8 *)malloc(data2Size);
     fread(data2, 1, data2Size, mds);
-
 
     DecryptBlock(data2, data2Size, 0, 0, 4, ci);
 
@@ -130,18 +128,34 @@ int main(int argc, const char *argv[])
     {
         printf("Encryption detected\n");
 
+        const char *password = NULL;
+
         if (argc < 3)
-        {
-            printf("Please specify password as 2nd argument\n");
-            return 0;
-        }
+            printf("Trying without password\n");
+        else
+            password = argv[2];
+
+
 
         PCRYPTO_INFO ci2;
-        if ( decode1(mdxHeader + keyBlockOff, argv[2], &ci2) == 0 )
-            printf("Password \"%s\": OK\n", argv[2]);
+        if ( decode1(mdxHeader + keyBlockOff, password, &ci2) == 0 )
+            if (password)
+                printf("Password \"%s\": OK\n", password);
+            else
+                printf("It's encrypted with NULL password. OK!\n");
         else
         {
-            printf("Password \"%s\": WRONG\n", argv[2]);
+            if (password)
+                printf("Password \"%s\": WRONG\n", argv[2]);
+            else
+                printf("Please specify password as 2nd argument. Seems it's necessery.\n");
+
+            printf("But we save header_not_decrypted.out with encrypted key block\n");
+
+            FILE *b = fopen("header_not_decrypted.out", "wb");
+            fwrite(mdxHeader, 1, decSize + 0x12, b);
+            fclose(b);
+
             return -1;
         }
 
